@@ -21,12 +21,23 @@ module NoSE
 
       class_option :debug, type: :boolean, aliases: '-d',
                    desc: 'enable detailed debugging information'
-      class_option :parallel, type: :boolean, default: false,
+      class_option :parallel, type: :boolean, default: true,
                    desc: 'run various operations in parallel'
       class_option :colour, type: :boolean, default: nil, aliases: '-c',
                    desc: 'enabled coloured output'
       class_option :interactive, type: :boolean, default: true,
                    desc: 'allow actions which require user input'
+      class_option :prunedCF, type: :boolean, default: true,
+                 desc: 'whether enumerate CFs using pruned index enumerator or not'
+      class_option :enumerator, type: :string, default: 'graph_based',
+                   enum: %w(default pruned simple graph_based),
+                   desc: 'the objective function to use in the ILP'
+      class_option :iterative, type: :boolean, default: true,
+                   desc: 'whether execute optimization in iterative method'
+      class_option :is_shared_field_threshold, type: :numeric, default: 2,
+                   desc: 'query num threshold for decide whether the field is shared among queries'
+      class_option :choice_limit, type: :numeric, default: 10_000,
+                   desc: 'maximum number of key combinations for indexes in PrunedIndexEnumerator'
 
       def initialize(_options, local_options, config)
         super
@@ -115,10 +126,38 @@ module NoSE
       def search_result(workload, cost_model, max_space = Float::INFINITY,
                         objective = Search::Objective::COST,
                         by_id_graph = false)
-        enumerated_indexes = IndexEnumerator.new(workload) \
+
+        STDERR.puts "measure runtime: start enumeration: #{DateTime.now.strftime('%Q')}"
+        enumerated_indexes = enumerate_indexes(workload, cost_model)
+
+        search = (options[:iterative] and workload.timesteps > 3) ?
+                     Search::IterativeSearch.new(workload, cost_model, objective, by_id_graph, options[:prunedCF])
+                     : Search::Search.new(workload, cost_model, objective, by_id_graph, options[:prunedCF])
+        indexes = search.pruning_indexes_by_plan_cost enumerated_indexes
+        search.search_overlap indexes, max_space
+      end
+
+      # enumerate indexes
+      # @return [Search::Index]
+      def enumerate_indexes(workload, cost_model)
+        STDERR.puts "enumerate column families"
+        if options[:enumerator] == "pruned"
+          enumerated_indexes =
+              PrunedIndexEnumerator.new(workload, cost_model,
+                                        options[:is_shared_field_threshold], 2,2, choice_limit_size: options[:choice_limit]) \
                                             .indexes_for_workload.to_a
-        Search::Search.new(workload, cost_model, objective, by_id_graph) \
-                      .search_overlap enumerated_indexes, max_space, @options[:creation_cost]
+        elsif options[:enumerator] == "graph_based"
+          enumerated_indexes =
+            GraphBasedIndexEnumerator.new(workload, cost_model, 2, options[:choice_limit]) \
+                                            .indexes_for_workload.to_a
+        elsif options[:enumerator] == "default"
+          enumerated_indexes = IndexEnumerator.new(workload) \
+                                              .indexes_for_workload.to_a
+        elsif options[:enumerator] == "simple"
+          enumerated_indexes = SimpleIndexEnumerator.new(workload) \
+                                              .indexes_for_workload.to_a
+        end
+        enumerated_indexes
       end
 
       # Load results of a previous search operation
@@ -201,7 +240,8 @@ module NoSE
         file.puts Formatador.parse("[blue]#{header}[/]")
         indexes.each_with_index do |index_set, ts|
           file.puts Formatador.parse("[blue]for timestep: #{ts}[/]")
-          index_set.sort_by(&:key).each { |index| file.puts index.inspect }
+          index_set = [index_set] unless index_set.is_a?(Array) or index_set.is_a?(Set)
+          index_set.sort_by(&:hash_str).each { |index| file.puts index.inspect }
         end
         file.puts
       end
@@ -227,7 +267,7 @@ module NoSE
 
             file.puts "GROUP #{plan.group}" unless plan.group.nil?
 
-            weight = " * #{weight[ts]} = #{cost}"
+            weight = " (cost:#{plan.cost}) * (weight: #{weight[ts]}) = #{cost}"
             file.puts '  ' * (indent - 1) + plan.query.label \
             unless plan.query.nil? || plan.query.label.nil?
             file.puts '  ' * (indent - 1) + plan.query.inspect + weight
@@ -247,7 +287,7 @@ module NoSE
 
           file.puts "GROUP #{plan.group}" unless plan.group.nil?
 
-          weight = " * #{weight} = #{cost}"
+          weight = " (cost:#{plan.cost}) * (weight: #{weight}) = #{cost}"
           file.puts '  ' * (indent - 1) + plan.query.label \
             unless plan.query.nil? || plan.query.label.nil?
           file.puts '  ' * (indent - 1) + plan.query.inspect + weight
@@ -259,17 +299,18 @@ module NoSE
       def output_migration_plans_txt(plans, file, indent)
         header = "Migrate plans\n" + '━' * 50
         file.puts Formatador.parse("[blue]#{header}[/]")
+        #plans.sort_by{|mp| [mp.start_time, (mp.query.is_a?(Query) ? mp.query.text : mp.query)]}.each do |migrate_plan|
         plans.sort_by{|mp| [mp.query.text, mp.start_time]}.each do |migrate_plan|
-          file.puts '  ' * (indent - 1) + migrate_plan.query.label \
-            unless migrate_plan.query.nil? || migrate_plan.query.label.nil?
+          file.puts '  ' * (indent - 1) + (migrate_plan.query.is_a?(Query) ? migrate_plan.query.label : migrate_plan.query.text) \
+            unless migrate_plan.query.nil? || (migrate_plan.query.is_a?(Query) ? migrate_plan.query.label.nil? : migrate_plan.query.nil?)
           file.puts '  ' * (indent - 1) + migrate_plan.query.inspect
           file.puts Formatador.parse('  ' * indent + "[blue]timestep: #{migrate_plan.start_time} to #{migrate_plan.end_time}[/]")
-          file.puts Formatador.parse('  ' * indent + "[blue]obsolete plan: [/]")
+          file.puts Formatador.parse('  ' * indent + "[blue]obsolete plan, cost: #{migrate_plan.obsolete_plan&.cost} [/]")
           migrate_plan.obsolete_plan&.each { |step| file.puts '  ' * (indent + 1) + step.inspect }
-          file.puts Formatador.parse('  ' * indent + "[blue]new plan: [/]")
+          file.puts Formatador.parse('  ' * indent + "[blue]new plan, cost #{migrate_plan.new_plan.cost} [/]")
           migrate_plan.new_plan&.each { |step| file.puts '  ' * (indent + 1) + step.inspect }
           migrate_plan.prepare_plans.each do |prepare_plan|
-            file.puts Formatador.parse('  ' * indent + "[blue]prepare plan: for #{prepare_plan.index.inspect}[/]")
+            file.puts Formatador.parse('  ' * indent + "[blue]prepare plan, cost: #{prepare_plan.query_plan.cost}: for #{prepare_plan.index.inspect}[/]")
             prepare_plan.query_plan.each { |step| file.puts '  ' * (indent + 1) + step.inspect }
           end
           file.puts
@@ -296,6 +337,7 @@ module NoSE
       # Output update plans as text
       # @return [void]
       def time_depend_output_update_plans_txt(update_plans, file, weights, mix = nil)
+        return if update_plans.nil?
         unless update_plans.all?{ |update_plan| update_plan.empty?}
           header = "Update plans\n" + '━' * 50
           file.puts Formatador.parse("[blue]#{header}[/]")
@@ -343,6 +385,21 @@ module NoSE
         end
       end
 
+      def output_update_plan(plan, file, weight = nil, indents = 1)
+        file.puts Formatador.parse(" for [magenta]#{plan.index.key}[/] " \
+                                   "[yellow]$#{plan.cost}[/]")
+        query_weights = Hash[plan.query_plans.map do |query_plan|
+          [query_plan.query, weight]
+        end]
+        output_plans_txt plan.query_plans, file, 2, query_weights
+
+        plan.update_steps.each do |step|
+          file.puts '  ' * indents + step.inspect
+        end
+
+        file.puts
+      end
+
       # Output update plans as text
       # @return [void]
       def output_update_plans_txt(update_plans, file, weights, mix = nil)
@@ -368,22 +425,42 @@ module NoSE
           file.puts statement.label unless statement.label.nil?
           file.puts "#{statement.inspect} * #{weight} = #{total_cost * weight}"
           plans.each do |plan|
-            file.puts Formatador.parse(" for [magenta]#{plan.index.key}[/] " \
-                                       "[yellow]$#{plan.cost}[/]")
-            query_weights = Hash[plan.query_plans.map do |query_plan|
-              [query_plan.query, weight]
-            end]
-            output_plans_txt plan.query_plans, file, 2, query_weights
-
-            plan.update_steps.each do |step|
-              file.puts '  ' + step.inspect
-            end
-
-            file.puts
+            output_update_plan plan, file, weight
           end
 
           file.puts "\n"
         end
+      end
+
+      # @param Hash[statement, plans for each timestep]
+      def time_depend_output_update_plans_diff_txt(td_update_plans, file)
+        return if td_update_plans.nil?
+        header = "Upseart plan diff \n" + '━' * 50
+        file.puts Formatador.parse("[blue]#{header}[/]")
+        td_update_plans.each do |stmt, plans|
+          file.puts Formatador.parse("[yellow]============= #{stmt.text} ============[/]")
+          plans.each_cons(2).to_a.each_with_index do |(former, current), i|
+            file.puts Formatador.parse('  ' + "[blue]timestep: #{i} to #{i + 1}[/]")
+            file.puts "  deleted plans ============================"
+            former.reject{|f| current.any?{|c| compare_update_plans f, c}}.each do |deleted_plan|
+              output_update_plan deleted_plan, file, -1, 2
+            end
+            file.puts "  added plans ============================"
+            current.reject{|c| former.any?{|f| compare_update_plans f, c}}.each do |added_plan|
+              output_update_plan added_plan, file, -1, 2
+            end
+          end
+        end
+        file.puts "\n"
+      end
+
+      def compare_update_plans(left , right)
+        return false if left.index != right.index
+        return false if left.query_plans != right.query_plans
+        return false if left.statement != right.statement
+        return false if left.update_fields != right.update_fields
+        return false if left.update_steps != right.update_steps
+        true
       end
 
       # Output the results of advising as text
@@ -397,7 +474,9 @@ module NoSE
 
         header = "Indexes\n" + '━' * 50
         if result.is_a? NoSE::Search::TimeDependResults
-          time_depend_output_indexes_txt header, result.indexes, file
+          #time_depend_output_indexes_txt header, result.indexes, file
+          indexes_each_ts = result.time_depend_indexes.indexes_all_timestep.map{|tdi| tdi.indexes}
+          time_depend_output_indexes_txt header, indexes_each_ts, file
         else
           output_indexes_txt header, result.indexes, file
         end
@@ -421,6 +500,8 @@ module NoSE
         if result.is_a? NoSE::Search::TimeDependResults
           time_depend_output_update_plans_txt result.update_plans, file, weights,
                                               result.workload.mix
+
+          time_depend_output_update_plans_diff_txt reserialized_update_plans, file
         else
           output_update_plans_txt result.update_plans, file, weights,
                                   result.workload.mix
@@ -541,6 +622,8 @@ require_relative 'nose_cli/reformat'
 require_relative 'nose_cli/repl'
 require_relative 'nose_cli/recost'
 require_relative 'nose_cli/search'
+require_relative 'nose_cli/search_migrations'
+require_relative 'nose_cli/view_result_txt'
 require_relative 'nose_cli/search_all'
 require_relative 'nose_cli/search_bench'
 require_relative 'nose_cli/search_pattern'

@@ -22,8 +22,6 @@ module NoSE
                               banner: 'ITERATIONS',
                               desc: 'the number of times to execute each ' \
                                     'statement'
-      option :repeat, type: :numeric, default: 1,
-                      desc: 'how many times to repeat the benchmark'
       option :group, type: :string, default: nil, aliases: '-g',
                      desc: 'restrict the benchmark to statements in the ' \
                            'given group'
@@ -60,8 +58,7 @@ module NoSE
           end.map(&:index)
 
           measurement = bench_query backend, indexes, plan, index_values,
-                                    options[:num_iterations], options[:repeat],
-                                    weight: weight
+                                    options[:num_iterations], weight: weight
           next if measurement.empty?
 
           measurement.estimate = plan.cost
@@ -87,8 +84,7 @@ module NoSE
             indexes = plan.query_plans.flat_map(&:indexes) << plan.index
 
             measurement = bench_update backend, indexes, plan, index_values,
-                                       options[:num_iterations],
-                                       options[:repeat], weight: weight
+                                       options[:num_iterations], weight: weight
             next if measurement.empty?
 
             measurement.estimate = plan.cost
@@ -131,14 +127,17 @@ module NoSE
 
       # Get a sample of values from each index used by the queries
       # @return [Hash]
-      def index_values(indexes, backend, iterations = nil, fail_on_empty = true)
-        Hash[indexes.map do |index|
-          values = backend.index_sample(index, iterations).to_a
-          fail "Index #{index.key} is empty and will produce no results" \
-            if values.empty? && fail_on_empty
+      def index_values(indexes, backend, iterations = nil, fail_on_empty = true, nullable_indexes: [])
+        nullable_indexes = [] if nullable_indexes.nil?
+        index_values_hash = Parallel.map(indexes, in_threads: 5) do |index|
+          values = backend.index_sample(index, iterations, nullable_indexes.any?{|ni| ni == index}).to_a
+          fail "Index #{index.key}: #{index.hash_str} is empty and will produce no results" \
+            if values.empty? && fail_on_empty && !nullable_indexes.nil? && !nullable_indexes.include?(index)
 
-          [index, values]
-        end]
+          Hash[index, values]
+        end.reduce(&:merge)
+
+        index_values_hash
       end
     end
   end

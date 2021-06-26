@@ -22,8 +22,6 @@ module NoSE
              banner: 'ITERATIONS',
              desc: 'the number of times to execute each ' \
                                     'statement'
-      option :repeat, type: :numeric, default: 1,
-             desc: 'how many times to repeat the benchmark'
       option :group, type: :string, default: nil, aliases: '-g',
              desc: 'restrict the benchmark to statements in the ' \
                            'given group'
@@ -31,7 +29,7 @@ module NoSE
              desc: 'abort if a column family is empty'
       option :totals, type: :boolean, default: false, aliases: '-t',
              desc: 'whether to include group totals in the output'
-      option :format, type: :string, default: 'txt',
+      option :format, type: :string, default: 'csv',
              enum: %w(txt csv), aliases: '-f',
              desc: 'the format of the output data'
 
@@ -51,6 +49,8 @@ module NoSE
                            '(useful for testing)'
       option :skip_nonempty, type: :boolean, default: true, aliases: '-s',
              desc: 'ignore indexes which are not empty'
+      option :validate_migration, type: :boolean, default: true, aliases: '-v',
+             desc: 'whether migration process'
 
       def td_benchmark(plan_file)
         label = File.basename plan_file, '.*'
@@ -58,19 +58,34 @@ module NoSE
         result, backend = load_time_depend_plans plan_file, options
         loader = get_class('loader', options).new result.workload, backend
         backend.clear_keyspace
-        set_up_db(result, backend, loader)
+        setup_db(result, backend, loader)
 
         (0...result.timesteps).each do |timestep|
           STDERR.puts "\e[33m timestep: #{timestep} ===================================================== \e[0m"
-          migration_worker, _ = exec_migration_async(plan_file, result, timestep)
-          #exec_migration(result, timestep)
+
+          # this works only for localhost
+          #puts `docker exec cassandra_migrate nodetool flush`
+
+          if timestep < result.timesteps - 1
+            under_creating_indexes = result.time_depend_indexes.indexes_all_timestep[timestep + 1].indexes.to_set -
+                result.time_depend_indexes.indexes_all_timestep[timestep].indexes.to_set
+
+            under_creating_indexes.each do |under_creating_index|
+              backend.create_index(under_creating_index, !options[:dry_run], true)
+              STDERR.puts under_creating_index.key + " is created before query processing"
+            end
+          end
+
+          migrator = Migrator::Migrator.new(backend, loader, options[:loader], options[:validate_migration])
+          #migration_worker, _ = migrate_async(result, timestep, migrator)
+          migrator.migrate(result, timestep)
 
           indexes_for_this_timestep = result.indexes_used_in_plans(timestep)
           index_values = index_values indexes_for_this_timestep, backend,
                                       options[:num_iterations],
                                       options[:fail_on_empty]
           group_tables = Hash.new { |h, k| h[k] = [] }
-          group_totals = Hash.new { |h, k| h[k] = 0 }
+          group_totals = Hash.new { |h, k| h[k] = [0] * options[:num_iterations]}
 
           result.time_depend_plans.map{|tdp| tdp.plans[timestep]}.each do |plan|
             query = plan.query
@@ -82,13 +97,16 @@ module NoSE
 
             next unless options[:group].nil? || plan.group == options[:group]
 
-            measurement = bench_query backend, plan.indexes, plan, index_values,
-                                      options[:num_iterations], options[:repeat],
-                                      weight: weight
+            measurement = nil
+            #StackProf.run(mode: :wall, raw: true, out: "tmp/bench_query_#{timestep}.dump") do
+              measurement = bench_query backend, plan.indexes, plan, index_values,
+                                        options[:num_iterations],
+                                        weight: weight
+            #end
             next if measurement.empty?
 
             measurement.estimate = plan.cost
-            group_totals[plan.group] += measurement.mean
+            group_totals[plan.group] = [group_totals[plan.group], measurement.values].transpose.map(&:sum)
             group_tables[plan.group] << measurement
           end
 
@@ -113,21 +131,30 @@ module NoSE
               # Get all indexes used by support queries
               indexes = plan.query_plans.flat_map(&:indexes) << plan.index
 
+              # re-setting parameters for the update.
+              # index_values possible become obsolete because of the value on the CF can be changed by other update plans
+              index_values = index_values indexes, backend,
+                                          options[:num_iterations],
+                                          options[:fail_on_empty],
+                                          nullable_indexes: under_creating_indexes
+
               measurement = bench_update backend, indexes, plan, index_values,
-                                         options[:num_iterations],
-                                         options[:repeat], weight: weight
-              next if measurement.empty?
+                                         options[:num_iterations], weight: weight
+              if measurement.empty?
+                puts "measurement was empty"
+                next
+              end
 
               measurement.estimate = plan.cost
-              group_totals[plan.group] += measurement.mean
+              group_totals[plan.group] = [group_totals[plan.group], measurement.values].transpose.map(&:sum)
               group_tables[plan.group] << measurement
             end
           end
 
-          total = 0
+          total = [0] * options[:num_iterations]
           table = []
           group_totals.each do |group, group_total|
-            total += group_total
+            total = [total, group_total].transpose.map(&:sum)
             total_measurement = Measurements::Measurement.new nil, 'TOTAL'
             group_table = group_tables[group]
             total_measurement << group_table.map{|gt| gt.weighted_mean(timestep)} \
@@ -153,109 +180,38 @@ module NoSE
             td_output_csv table
           end
 
-          migration_worker.stop
-          STDERR.puts "cleanup"
-          exec_cleanup(backend, result, timestep)
+          #migrator.stop
+          migrator.exec_cleanup(result, timestep)
+          GC.start
         end
       end
 
       private
 
-      def set_up_db(result, backend, loader)
+      def setup_db(result, backend, loader)
         indexes = result.time_depend_indexes.indexes_all_timestep.first.indexes
         # Produce the DDL and execute unless the dry run option was given
         backend.create_indexes(indexes, !options[:dry_run], options[:skip_existing],
                                options[:drop_existing]).each {|ddl| STDERR.puts ddl}
 
+        load_started = Time.now.utc
         # Create a new instance of the loader class and execute
         loader.load indexes, options[:loader], options[:progress],
                     options[:limit], options[:skip_nonempty]
-      end
-
-      def exec_migration(plan_file, result, timestep)
-        migration_plans = result.migrate_plans.select{|mp| mp.start_time == timestep}
-
-        migration_plans.each do |migration_plan|
-          _, backend = load_time_depend_plans plan_file, options
-          prepare_next_indexes(migration_plan, backend)
-        end
-      end
-
-      def exec_cleanup(backend, result, timestep)
-        migration_plans = result.migrate_plans.select{|mp| mp.start_time == timestep}
-        plans_for_timestep = result.time_depend_plans.map{|tdp| tdp.plans[timestep + 1]}
-
-        migration_plans.each do |migration_plan|
-          drop_obsolete_tables(migration_plan, backend, plans_for_timestep)
-        end
-      end
-
-      # join the value of indexes
-      def inner_loop_join(index_values)
-        return index_values.to_a.flatten(1)[1] if index_values.length == 1
-
-        result = []
-        index_values.each_cons(2) do |former_index, next_index|
-          overlap_fields = former_index[0].all_fields & next_index[0].all_fields
-          former_index[1].each do |former_value|
-            next_index[1].each do |next_value|
-              next unless overlap_fields.all? { |overlap_field| former_value[overlap_field.id] == next_value[overlap_field.id]}
-              result << former_value.merge(next_value)
-            end
-          end
-        end
-        result
-      end
-
-      # @param [MigratePlan, Backend]
-      def prepare_next_indexes(migrate_plan, backend)
-        STDERR.puts "\e[36m migrate from: \e[0m"
-        migrate_plan.obsolete_plan&.map{|step| STDERR.puts '  ' + step.inspect}
-        STDERR.puts "\e[36m to: \e[0m"
-        migrate_plan.new_plan.map{|step| STDERR.puts '  ' + step.inspect}
-
-        migrate_plan.new_plan.steps.each do |new_step|
-          next unless new_step.is_a? Plans::IndexLookupPlanStep
-          query_plan = migrate_plan.prepare_plans.find{|pp| pp.index == new_step.index}&.query_plan
-          next if query_plan.nil?
-
-          values = index_values(query_plan.indexes, backend)
-          obsolete_data = inner_loop_join(values)
-
-          unless backend.index_exists?(new_step.index)
-            STDERR.puts backend.create_index(new_step.index, !options[:dry_run], options[:skip_existing])
-            backend.index_insert(new_step.index, obsolete_data)
-          end
-        end
-      end
-
-      def drop_obsolete_tables(migrate_plan, backend, plans_for_timestep)
-        return if migrate_plan.obsolete_plan.nil?
-        migrate_plan.obsolete_plan.indexes.each do |index|
-          next if plans_for_timestep.any? {|plan| plan.indexes.include? index}
-
-          STDERR.puts "Dropping #{index.key}"
-          backend.drop_index(index)
-        end
-      end
-
-      def exec_migration_async(plan_file, result, timestep)
-        migration_worker = NoSE::Worker.new {|_| exec_migration(plan_file, result, timestep)}
-        [migration_worker].map(&:run).each(&:join)
-        thread = migration_worker.execute
-        thread.join
-        [migration_worker, thread]
+        load_ended = Time.now.utc
+        STDERR.puts "whole loading time: " + (load_ended - load_started).to_s
       end
 
       # Output the table of results
       # @return [void]
       def td_output_table(table)
         columns = [
-          'timestep', 'label', 'group',
-          { 'measurements.name' => { display_name: 'name' } },
-          { 'measurements.weight' => { display_name: 'weight' } },
-          { 'measurements.mean' => { display_name: 'mean' } },
-          { 'measurements.estimate' => { display_name: 'cost' } }
+            'timestep', 'label', 'group',
+            { 'measurements.name' => { display_name: 'name' } },
+            { 'measurements.weight' => { display_name: 'weight' } },
+            { 'measurements.mean' => { display_name: 'mean' } },
+            { 'measurements.estimate' => { display_name: 'cost' } },
+            { 'measurements.standard_error' => { display_name: 'standard_error' } }
         ]
 
         tp table, *columns
@@ -265,18 +221,19 @@ module NoSE
       # @return [void]
       def td_output_csv(table)
         csv_str = CSV.generate do |csv|
-          csv << %w(timestep label group name weight mean cost)
+          csv << %w(timestep label group name weight mean cost standard_error)
 
           table.each do |group|
             group.measurements.each do |measurement|
               csv << [
-                group.timestep,
-                group.label,
-                group.group,
-                measurement.name,
-                measurement.weight,
-                measurement.mean,
-                measurement.estimate
+                  group.timestep,
+                  group.label,
+                  group.group,
+                  measurement.name,
+                  measurement.weight,
+                  measurement.mean,
+                  measurement.estimate,
+                  measurement.standard_error
               ]
             end
           end
